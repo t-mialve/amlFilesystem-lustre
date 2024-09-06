@@ -25,3 +25,26 @@ Index: linux-5.14.0-427.24.1.el9_4/fs/ext4/inode.c
  	if (flags & EXT4_IGET_EA_INODE) {
  		if (!(EXT4_I(inode)->i_flags & EXT4_EA_INODE_FL))
  			return "missing EA_INODE flag";
+Index: linux-5.14.0-427.24.1.el9_4/fs/ext4/namei.c
+===================================================================
+--- linux-5.14.0-427.24.1.el9_4.orig/fs/ext4/namei.c
++++ linux-5.14.0-427.24.1.el9_4/fs/ext4/namei.c
+@@ -2214,6 +2214,7 @@ static struct dentry *ext4_lookup(struct
+ 	struct inode *inode;
+ 	struct ext4_dir_entry_2 *de;
+ 	struct buffer_head *bh;
++	struct ext4_sb_info *sbi = EXT4_SB(dir->i_sb);
+ 
+ 	if (dentry->d_name.len > EXT4_NAME_LEN)
+ 		return ERR_PTR(-ENAMETOOLONG);
+@@ -2234,7 +2235,9 @@ static struct dentry *ext4_lookup(struct
+ 					 dentry);
+ 			return ERR_PTR(-EFSCORRUPTED);
+ 		}
+-		inode = ext4_iget(dir->i_sb, ino, EXT4_IGET_NORMAL);
++		inode = ext4_iget(dir->i_sb, ino,
++				  dir->i_ino == sbi->s_first_ino ?
++				  EXT4_IGET_NO_CHECKS : EXT4_IGET_NORMAL);
+ 		if (inode == ERR_PTR(-ESTALE)) {
+ 			EXT4_ERROR_INODE(dir,
+ 					 "deleted inode referenced: %u",
