@@ -863,7 +863,7 @@ static inline int ldlm_ast_fini(struct ptlrpc_request *req,
 	ENTRY;
 
 	if (unlikely(instant_cancel)) {
-		rc = ptl_send_rpc(req, 1);
+		rc = ptl_send_rpc(req, PTL_RPC_NO_REPLY);
 		ptlrpc_req_put(req);
 		if (rc == 0)
 			atomic_inc(&arg->restart);

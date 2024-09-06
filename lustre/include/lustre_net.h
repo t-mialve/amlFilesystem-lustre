@@ -1026,7 +1026,8 @@ struct ptlrpc_request {
 		/* bulk request, sent to server, but uncommitted */
 		rq_unstable:1,
 		rq_early_free_repbuf:1, /* free reply buffer in advance */
-		rq_allow_intr:1;
+		rq_allow_intr:1,
+		rq_new_alloc:1;
 	/** @} */
 
 	/** server-side flags are serialized by rq_lock @{ */
@@ -2070,7 +2071,10 @@ int ptlrpc_reply(struct ptlrpc_request *req);
 int ptlrpc_send_error(struct ptlrpc_request *req, int difficult);
 int ptlrpc_error(struct ptlrpc_request *req);
 int ptlrpc_at_get_net_latency(struct ptlrpc_request *req);
-int ptl_send_rpc(struct ptlrpc_request *request, int noreply);
+#define PTL_RPC_REPLY			0x00
+#define PTL_RPC_NO_REPLY		0x01
+#define PTL_RPC_NO_SLEEP		0x02
+int ptl_send_rpc(struct ptlrpc_request *request, int rpc_flags);
 int ptlrpc_register_rqbd(struct ptlrpc_request_buffer_desc *rqbd);
 /** @} */
 
@@ -2436,6 +2440,7 @@ ptlrpc_rqphase_move(struct ptlrpc_request *req, enum rq_phase new_phase)
 	if (req->rq_phase == new_phase)
 		return;
 
+	req->rq_new_alloc = 0;
 	if (new_phase == RQ_PHASE_UNREG_RPC ||
 	    new_phase == RQ_PHASE_UNREG_BULK) {
 		/* No embedded unregistering phases */

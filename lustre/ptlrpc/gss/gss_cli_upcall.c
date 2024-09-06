@@ -444,7 +444,7 @@ int gss_do_ctx_fini_rpc(struct gss_cli_ctx *gctx)
         }
 
         req->rq_phase = RQ_PHASE_RPC;
-        rc = ptl_send_rpc(req, 1);
+        rc = ptl_send_rpc(req, PTL_RPC_NO_REPLY);
         if (rc)
                 CWARN("ctx %p(%u->%s): rpc error %d, destroy locally\n", ctx,
                       ctx->cc_vcred.vc_uid, sec2target_str(ctx->cc_sec), rc);

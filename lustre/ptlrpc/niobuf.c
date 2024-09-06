@@ -706,15 +706,19 @@ int ptlrpc_error(struct ptlrpc_request *req)
 
 /**
  * Send request \a request.
- * if \a noreply is set, don't expect any reply back and don't set up
- * reply buffers.
+ * if \a rpc_flags has PTL_RPC_NO_REPLY set, don't expect any reply back and
+ * don't set up reply buffers.
+ * if \a rpc_flags has RPC_NO_SLEEP set, do not allocate reply buffer and
+ * return with -EAGAIN.
  * Returns 0 on success or error code.
  */
-int ptl_send_rpc(struct ptlrpc_request *request, int noreply)
+int ptl_send_rpc(struct ptlrpc_request *request, int rpc_flags)
 {
 	int rc;
 	__u32 opc;
 	int mpflag = 0;
+	bool noreply = rpc_flags & PTL_RPC_NO_REPLY;
+	bool nosleep = rpc_flags & PTL_RPC_NO_SLEEP;
 	bool rep_mbits = false;
 	struct lnet_handle_md bulk_cookie;
 	struct lnet_processid peer;
@@ -838,6 +842,12 @@ int ptl_send_rpc(struct ptlrpc_request *request, int noreply)
 	rc = sptlrpc_cli_wrap_request(request);
 	if (rc)
 		GOTO(out, rc);
+
+	request->rq_new_alloc = 0;
+	if (!noreply && nosleep && !request->rq_repbuf) {
+		request->rq_new_alloc = 1;
+		GOTO(out, rc = -EAGAIN);
+	}
 
 	/* bulk register should be done after wrap_request() */
 	if (request->rq_bulk != NULL) {

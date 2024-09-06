@@ -105,7 +105,7 @@ const struct ptlrpc_bulk_frag_ops ptlrpc_bulk_kiov_nopin_ops = {
 };
 EXPORT_SYMBOL(ptlrpc_bulk_kiov_nopin_ops);
 
-static int ptlrpc_send_new_req(struct ptlrpc_request *req);
+static int ptlrpc_send_new_req(struct ptlrpc_request *req, int rpc_flags);
 static int ptlrpcd_check_work(struct ptlrpc_request *req);
 static int ptlrpc_unregister_reply(struct ptlrpc_request *request, int async);
 
@@ -1223,7 +1223,7 @@ void ptlrpc_set_add_req(struct ptlrpc_request_set *set,
 		 * If the request set has a producer callback, the RPC must be
 		 * sent straight away
 		 */
-		ptlrpc_send_new_req(req);
+		ptlrpc_send_new_req(req, PTL_RPC_REPLY);
 }
 EXPORT_SYMBOL(ptlrpc_set_add_req);
 
@@ -1681,7 +1681,7 @@ static int after_reply(struct ptlrpc_request *req)
  * Also adjusts request phase.
  * Returns 0 on success or error code.
  */
-static int ptlrpc_send_new_req(struct ptlrpc_request *req)
+static int ptlrpc_send_new_req(struct ptlrpc_request *req, int rpc_flags)
 {
 	struct obd_import *imp = req->rq_import;
 	__u64 min_xid = 0;
@@ -1795,7 +1795,7 @@ static int ptlrpc_send_new_req(struct ptlrpc_request *req)
 	       obd_import_nid2str(imp), lustre_msg_get_opc(req->rq_reqmsg),
 	       lustre_msg_get_jobid(req->rq_reqmsg) ?: "");
 
-	rc = ptl_send_rpc(req, 0);
+	rc = ptl_send_rpc(req, rpc_flags);
 	if (rc == -ENOMEM) {
 		spin_lock(&imp->imp_lock);
 		if (!list_empty(&req->rq_list)) {
@@ -1844,15 +1844,46 @@ static inline int ptlrpc_set_producer(struct ptlrpc_request_set *set)
 	RETURN((atomic_read(&set->set_remaining) - remaining));
 }
 
+static int ptl_send_rpc_handler(struct ptlrpc_request *req)
+{
+	struct obd_import *imp = req->rq_import;
+	int rc;
+
+	if (req->rq_phase == RQ_PHASE_NEW && req->rq_new_alloc)
+		return ptlrpc_send_new_req(req, PTL_RPC_REPLY);
+
+	rc = ptl_send_rpc(req, PTL_RPC_REPLY);
+	if (rc == -ENOMEM) {
+		spin_lock(&imp->imp_lock);
+		if (!list_empty(&req->rq_list)) {
+			list_del_init(&req->rq_list);
+			if (atomic_dec_and_test(&imp->imp_inflight))
+				wake_up(&imp->imp_recovery_waitq);
+		}
+		spin_unlock(&imp->imp_lock);
+		ptlrpc_rqphase_move(req, RQ_PHASE_NEW);
+	}
+	if (rc) {
+		DEBUG_REQ(D_HA, req, "send failed: rc = %d", rc);
+		spin_lock(&req->rq_lock);
+		req->rq_net_err = 1;
+		spin_unlock(&req->rq_lock);
+	}
+	return rc;
+ }
+
 /**
- * this sends any unsent RPCs in \a set and returns 1 if all are sent
- * and no more replies are expected.
+ * this sends (or queues) any unsent RPCs in \a set and returns 1 if all are
+ * sent and no more replies are expected.
  * (it is possible to get less replies than requests sent e.g. due to timed out
  * requests or requests that we had trouble to send out)
  *
  * NOTE: This function contains a potential schedule point (cond_resched()).
  */
-int ptlrpc_check_set(const struct lu_env *env, struct ptlrpc_request_set *set)
+static int ptlrpc_check_set_common(const struct lu_env *env,
+				   struct ptlrpc_request_set *set,
+				   struct list_head *send,
+				   struct list_head *recv)
 {
 	struct ptlrpc_request *req, *next;
 	LIST_HEAD(comp_reqs);
@@ -1881,7 +1912,8 @@ int ptlrpc_check_set(const struct lu_env *env, struct ptlrpc_request_set *set)
 		 * Since the processing time is unbounded, we need to insert an
 		 * explicit schedule point to make the thread well-behaved.
 		 */
-		cond_resched();
+		if (!send)
+			cond_resched();
 
 		/*
 		 * If the caller requires to allow to be interpreted by force
@@ -1902,8 +1934,19 @@ int ptlrpc_check_set(const struct lu_env *env, struct ptlrpc_request_set *set)
 			GOTO(interpret, req->rq_status);
 		}
 
-		if (req->rq_phase == RQ_PHASE_NEW && ptlrpc_send_new_req(req))
-			force_timer_recalc = 1;
+		if (req->rq_phase == RQ_PHASE_NEW) {
+			int rc;
+			int flags = send ? PTL_RPC_NO_SLEEP : PTL_RPC_REPLY;
+
+			rc = ptlrpc_send_new_req(req, flags);
+			if (rc == -EAGAIN && req->rq_new_alloc && send) {
+				/* caller will send */
+				list_move_tail(&req->rq_set_chain, send);
+				continue;
+			}
+			if (rc)
+				force_timer_recalc = 1;
+		}
 
 		/* delayed send - skip */
 		if (req->rq_phase == RQ_PHASE_NEW && req->rq_sent)
@@ -2144,25 +2187,17 @@ int ptlrpc_check_set(const struct lu_env *env, struct ptlrpc_request_set *set)
 				    !ptlrpc_unregister_bulk(req, 1))
 					continue;
 
-				rc = ptl_send_rpc(req, 0);
-				if (rc == -ENOMEM) {
-					spin_lock(&imp->imp_lock);
-					if (!list_empty(&req->rq_list)) {
-						list_del_init(&req->rq_list);
-						if (atomic_dec_and_test(&imp->imp_inflight))
-							wake_up(&imp->imp_recovery_waitq);
-					}
-					spin_unlock(&imp->imp_lock);
-					ptlrpc_rqphase_move(req, RQ_PHASE_NEW);
+				if (send) {
+					/* caller will send */
+					list_move_tail(&req->rq_set_chain,
+						       send);
 					continue;
 				}
+
+				rc = ptl_send_rpc_handler(req);
 				if (rc) {
-					DEBUG_REQ(D_HA, req,
-						  "send failed: rc = %d", rc);
-					force_timer_recalc = 1;
-					spin_lock(&req->rq_lock);
-					req->rq_net_err = 1;
-					spin_unlock(&req->rq_lock);
+					if (rc != -ENOMEM)
+						force_timer_recalc = 1;
 					continue;
 				}
 				/* need to reset the timeout */
@@ -2172,7 +2207,11 @@ int ptlrpc_check_set(const struct lu_env *env, struct ptlrpc_request_set *set)
 			spin_lock(&req->rq_lock);
 
 			if (ptlrpc_client_early(req)) {
-				ptlrpc_at_recv_early_reply(req);
+				if (recv)
+					list_move_tail(&req->rq_set_chain,
+						       recv);
+				else
+					ptlrpc_at_recv_early_reply(req);
 				spin_unlock(&req->rq_lock);
 				continue;
 			}
@@ -2329,9 +2368,40 @@ interpret:
 	list_splice(&comp_reqs, &set->set_requests);
 
 	/* If we hit an error, we want to recover promptly. */
-	RETURN(atomic_read(&set->set_remaining) == 0 || force_timer_recalc);
+	RETURN(atomic_read(&set->set_remaining) == 0 ||
+	       (send && !list_empty(send)) || (recv && !list_empty(recv)) ||
+	       force_timer_recalc);
+}
+
+/**
+ * this queues any unsent RPCs in \a set and returns 1:
+ *  - if all are sent and no more replies are expected.
+ *
+ * NOTE: This function contains a potential schedule point (cond_resched()).
+ */
+int ptlrpc_check_set(const struct lu_env *env, struct ptlrpc_request_set *set)
+{
+	might_sleep();
+
+	return ptlrpc_check_set_common(env, set, NULL, NULL);
 }
 EXPORT_SYMBOL(ptlrpc_check_set);
+
+/**
+ * this queues any unsent RPCs in \a set and returns 1:
+ *  - if all are sent and no more replies are expected.
+ *  - the pending queue is not empty
+ *
+ * NOTE: the caller is reponsible for sending the queued requests
+ *       and adding the request back to the set.
+ */
+static int ptlrpc_check_set_nosleep(const struct lu_env *env,
+				    struct ptlrpc_request_set *set,
+				    struct list_head *send,
+				    struct list_head *recv)
+{
+	return ptlrpc_check_set_common(env, set, send, recv);
+}
 
 /**
  * Time out request \a req. is \a async_unlink is set, that means do not wait
@@ -2527,6 +2597,76 @@ time64_t ptlrpc_set_next_timeout(struct ptlrpc_request_set *set)
 	RETURN(timeout);
 }
 
+static inline
+int ptlrpc_set_wait_abortable(time64_t timeout, struct ptlrpc_request_set *set)
+{
+	struct ptlrpc_request *req, *next;
+	LIST_HEAD(send);
+	LIST_HEAD(recv);
+	int rc;
+	bool sending;
+
+	do {
+		sending = false;
+		rc = l_wait_event_abortable_timeout(
+			set->set_waitq,
+			ptlrpc_check_set_nosleep(NULL, set, &send, &recv),
+			cfs_time_seconds(timeout ? timeout : 1));
+		list_for_each_entry_safe(req, next, &send, rq_set_chain) {
+			sending = true;
+			ptl_send_rpc_handler(req);
+			list_move_tail(&req->rq_set_chain,
+				       &set->set_requests);
+		}
+		list_for_each_entry_safe(req, next, &recv, rq_set_chain) {
+			sending = true;
+			spin_lock(&req->rq_lock);
+			ptlrpc_at_recv_early_reply(req);
+			spin_unlock(&req->rq_lock);
+			list_move_tail(&req->rq_set_chain,
+				       &set->set_requests);
+		}
+	} while (sending);
+
+	return rc;
+}
+
+static inline
+int ptlrpc_set_wait_idle(time64_t timeout, struct ptlrpc_request_set *set)
+{
+	struct ptlrpc_request *req, *next;
+	LIST_HEAD(pending);
+	LIST_HEAD(send);
+	LIST_HEAD(recv);
+	int rc;
+	bool sending;
+
+	do {
+		sending = false;
+		rc = wait_event_idle_timeout(
+			set->set_waitq,
+			ptlrpc_check_set_nosleep(NULL, set, &send, &recv),
+			cfs_time_seconds(timeout ? timeout : 1));
+
+		list_for_each_entry_safe(req, next, &send, rq_set_chain) {
+			sending = true;
+			ptl_send_rpc_handler(req);
+			list_move_tail(&req->rq_set_chain,
+				       &set->set_requests);
+		}
+		list_for_each_entry_safe(req, next, &recv, rq_set_chain) {
+			sending = true;
+			spin_lock(&req->rq_lock);
+			ptlrpc_at_recv_early_reply(req);
+			spin_unlock(&req->rq_lock);
+			list_move_tail(&req->rq_set_chain,
+				       &set->set_requests);
+		}
+	} while (sending);
+
+	return rc;
+}
+
 /**
  * Send all unset request from the set and then wait untill all
  * requests in the set complete (either get a reply, timeout, get an
@@ -2545,7 +2685,7 @@ int ptlrpc_set_wait(const struct lu_env *env, struct ptlrpc_request_set *set)
 	else
 		list_for_each_entry(req, &set->set_requests, rq_set_chain) {
 			if (req->rq_phase == RQ_PHASE_NEW)
-				(void)ptlrpc_send_new_req(req);
+				(void)ptlrpc_send_new_req(req, PTL_RPC_REPLY);
 		}
 
 	if (list_empty(&set->set_requests))
@@ -2569,10 +2709,7 @@ int ptlrpc_set_wait(const struct lu_env *env, struct ptlrpc_request_set *set)
 			 * We still want to block for a limited time,
 			 * so we allow interrupts during the timeout.
 			 */
-			rc = l_wait_event_abortable_timeout(
-				set->set_waitq,
-				ptlrpc_check_set(NULL, set),
-				cfs_time_seconds(timeout ? timeout : 1));
+			rc = ptlrpc_set_wait_abortable(timeout, set);
 			if (rc == 0) {
 				rc = -ETIMEDOUT;
 				ptlrpc_expired_set(set);
@@ -2588,10 +2725,7 @@ int ptlrpc_set_wait(const struct lu_env *env, struct ptlrpc_request_set *set)
 			 * interrupts are allowed. Wait until all
 			 * complete, or an in-flight req times out.
 			 */
-			rc = wait_event_idle_timeout(
-				set->set_waitq,
-				ptlrpc_check_set(NULL, set),
-				cfs_time_seconds(timeout ? timeout : 1));
+			rc = ptlrpc_set_wait_idle(timeout, set);
 			if (rc == 0) {
 				ptlrpc_expired_set(set);
 				rc = -ETIMEDOUT;
