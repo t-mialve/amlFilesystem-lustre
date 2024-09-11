@@ -23,6 +23,7 @@
 # LUTF Turn off brp-python-precompile script as we don't want the python files
 # to be compiled on installation
 %global __os_install_post %(echo '%{__os_install_post}' | sed -e 's!/usr/lib[^[:space:]]*/brp-python-bytecompile[[:space:]].*$!!g')
+%global debug_package %{nil}
 
 # By default both gss and gss keyring are disabled.
 # gss keyring requires the gss core. If the builder
@@ -593,7 +594,22 @@ make %{?_smp_mflags} -s %{?make_args}
 # mpi
 %endif
 
-make install DESTDIR=$RPM_BUILD_ROOT
+%global __strip /bin/true
+
+%if %{defined rebuild}
+    echo "Rebuilding, skipping make install"
+    export DONT_STRIP=1
+    cp -r /root/2rpmbuild/BUILD/* /root/rpmbuild/BUILD
+    cp -r /root/2rpmbuild/BUILDROOT/* /root/rpmbuild/BUILDROOT
+    echo 602
+    find /root/rpmbuild/BUILDROOT -type f -name "*.ko" | while read -r file; do
+            echo "Processing $file"
+            stat "$file"
+            hexdump -Cv "$file" | tail -n 5
+     done
+%else
+    make install DESTDIR=$RPM_BUILD_ROOT
+%endif
 
 %if %{with lustre_modules}
 # RHEL's kernel_module_path macro expects that all the modules
@@ -631,6 +647,13 @@ if [ -d $RPM_BUILD_ROOT%{_libdir}/mpich ] ; then
 fi
 %endif
 
+echo 648
+find /root/rpmbuild/BUILDROOT -type f -name "*.ko" | while read -r file; do
+            echo "Processing $file"
+            stat "$file"
+            hexdump -Cv "$file" | tail -n 5
+done
+
 :> lustre.files
 
 %if %{with servers} && %{with lustre_utils}
@@ -666,6 +689,13 @@ echo '%{_sysconfdir}/init.d/lnet' >>lustre.files
 echo '%config(noreplace) %{_sysconfdir}/request-key.d/lgssc.conf' >>lustre.files
 %endif
 
+echo 690
+find /root/rpmbuild/BUILDROOT -type f -name "*.ko" | while read -r file; do
+            echo "Processing $file"
+            stat "$file"
+            hexdump -Cv "$file" | tail -n 5
+done
+
 # fc18 needs 'x' permission for library files
 find $RPM_BUILD_ROOT -name \*.so -type f -exec chmod +x {} \;
 
@@ -694,10 +724,25 @@ if [ -d $RPM_BUILD_ROOT%{_libdir}/lustre ] ; then
 fi
 %endif
 
+echo 725
+find /root/rpmbuild/BUILDROOT -type f -name "*.ko" | while read -r file; do
+            echo "Processing $file"
+            stat "$file"
+            hexdump -Cv "$file" | tail -n 5
+done
+
 %if %{with lustre_modules}
 # mark modules executable for find-debuginfo.sh
 find $RPM_BUILD_ROOT/lib/modules -name \*.ko -type f -exec chmod u+x {} \;
 %endif
+
+echo 737
+find /root/rpmbuild/BUILDROOT -type f -name "*.ko" | while read -r file; do
+            echo "Processing $file"
+            stat "$file"
+            hexdump -Cv "$file" | tail -n 5
+done
+
 
 rm -f $RPM_BUILD_ROOT%{_libdir}/liblustreapi.la
 
@@ -729,6 +774,17 @@ echo '%{_libdir}/lustre/tests/lutf/*' >>lustre-tests.files
 %if %{with lustre_tests_lutf}
 echo '%{_libdir}/lustre/tests/lutf/*' >>lustre-tests.files
 %endif
+
+echo 776
+find /root/rpmbuild/BUILDROOT -type f -name "*.ko" | while read -r file; do
+            echo "Processing $file"
+            stat "$file"
+            hexdump -Cv "$file" | tail -n 5
+done
+
+echo "begin lustre.files"
+cat lustre.files
+echo "end lustre.files"
 
 %files devel -f lustre-devel.files
 %defattr(-,root,root)
@@ -865,16 +921,44 @@ echo '%{_libdir}/lustre/tests/lutf/*' >>lustre-tests.files
 %systemd_post lnet.service
 %endif
 
+echo 918
+find /root/rpmbuild/BUILDROOT -type f -name "*.ko" | while read -r file; do
+            echo "Processing $file"
+            stat "$file"
+            hexdump -Cv "$file" | tail -n 5
+done
+
 %preun
 %if %{with systemd}
 %systemd_preun lnet.service
 %endif
+
+echo 930
+find /root/rpmbuild/BUILDROOT -type f -name "*.ko" | while read -r file; do
+            echo "Processing $file"
+            stat "$file"
+            hexdump -Cv "$file" | tail -n 5
+done
 
 %postun
 %if %{with systemd}
 %systemd_postun_with_restart lnet.service
 %endif
 
+echo 942
+find /root/rpmbuild/BUILDROOT -type f -name "*.ko" | while read -r file; do
+            echo "Processing $file"
+            stat "$file"
+            hexdump -Cv "$file" | tail -n 5
+done
+
 %clean
 rm -rf $RPM_BUILD_ROOT
 rm -rf %{_tmppath}/kmp
+
+echo 943
+find /root/rpmbuild/BUILDROOT -type f -name "*.ko" | while read -r file; do
+            echo "Processing $file"
+            stat "$file"
+            hexdump -Cv "$file" | tail -n 5
+done
